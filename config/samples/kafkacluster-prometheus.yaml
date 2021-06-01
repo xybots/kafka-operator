@@ -1,0 +1,207 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kafka-servicemonitor
+  labels:
+    app: kafka
+    kafka_cr: kafka
+    release: prometheus-operator
+spec:
+  selector:
+    matchLabels:
+      app: kafka
+      kafka_cr: kafka
+  namespaceSelector:
+    matchNames:
+    - kafka
+  endpoints:
+  - interval: 10s
+    port: metrics
+    path: /metrics
+    honorLabels: true
+    relabelings:
+    - sourceLabels: [__meta_kubernetes_pod_ip]
+      separator: ;
+      regex: (.*)
+      targetLabel: pod_ip
+      replacement: $1
+      action: replace
+    - sourceLabels: [__meta_kubernetes_pod_label_brokerId]
+      separator: ;
+      regex: (.*)
+      targetLabel: brokerId
+      replacement: $1
+      action: replace
+    - sourceLabels: [__meta_kubernetes_pod_label_kafka_cr]
+      separator: ;
+      regex: (.*)
+      targetLabel: kafka_cr
+      replacement: $1
+      action: replace
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: cruisecontrol-servicemonitor
+  labels:
+    app: cruisecontrol
+    kafka_cr: kafka
+    release: prometheus-operator
+spec:
+  selector:
+    matchLabels:
+      app: cruisecontrol
+  namespaceSelector:
+    matchNames:
+    - kafka
+  endpoints:
+  - interval: 10s
+    port: metrics
+    path: /metrics
+    honorLabels: true
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  creationTimestamp: null
+  labels:
+    prometheus: kafka-rules
+  name: kafka-alerts
+spec:
+  groups:
+  - name: KafkaAlerts
+    rules:
+    - alert: BrokerOverLoaded
+      expr: avg(sum by(brokerId, kafka_cr, namespace) (rate(kafka_network_requestmetrics_requests_total[15m]))) by (kafka_cr, namespace) > 30
+      for: 5m
+      labels:
+        severity: alert
+        alertGroup: kafka
+      annotations:
+        description: 'broker {{ $labels.brokerId }} overloaded (current value is: {{ $value }})'
+        summary: 'broker overloaded'
+        # If brokerConfigGroup is defined it will override scaled broker config
+        # brokerConfigGroup: 'default_group'
+        storageClass: 'gp2'
+        mountPath: '/kafkalog'
+        diskSize: '10G'
+        image: 'ghcr.io/banzaicloud/kafka:2.13-2.8.0'
+        # annotations to be applied onto the broker pod
+        # brokerAnnotations: '{ "sidecar.istio.io/logLevel": "trace", "sidecar.istio.io/proxyCPULimit": "50m" }'
+        command: 'upScale'
+    - alert: BrokerUnderReplicated
+      expr: kafka_server_replicamanager_underreplicatedpartitions > 0
+      for: 5m
+      labels:
+        severity: alert
+        alertGroup: kafka
+      annotations:
+        description: 'broker {{ $labels.brokerId }} underreplicated'
+        summary: 'broker underreplicated'
+        storageClass: 'gp2'
+        mountPath: '/kafkalog'
+        diskSize: '10G'
+        image: 'ghcr.io/banzaicloud/kafka:2.13-2.8.0'
+        # annotations to be applied onto the broker pod
+        # brokerAnnotations: '{ "sidecar.istio.io/logLevel": "trace", "sidecar.istio.io/proxyCPULimit": "50m" }'
+        command: 'upScale'
+    - alert: PartitionCountHigh
+      expr: max(kafka_server_replicamanager_partitioncount)  by (namespace, kafka_cr) > 100
+      for: 3m
+      labels:
+        severity: alert
+        alertGroup: kafka
+      annotations:
+        description: 'broker {{ $labels.brokerId }} has high partition count'
+        summary: 'high partition count'
+        storageClass: 'gp2'
+        mountPath: '/kafkalog'
+        diskSize: '10G'
+        image: 'ghcr.io/banzaicloud/kafka:2.13-2.8.0'
+        # annotations to be applied onto the broker pod
+        # brokerAnnotations: '{ "sidecar.istio.io/logLevel": "trace", "sidecar.istio.io/proxyCPULimit": "50m" }'
+        command: 'upScale'
+    - alert: PartitionCountLow
+      expr: min(kafka_server_replicamanager_partitioncount)  by (namespace, kafka_cr) < 40
+      for: 3m
+      labels:
+        severity: alert
+        alertGroup: kafka
+      annotations:
+        description: 'broker {{ $labels.brokerId }} has low partition count'
+        summary: 'low partition count'
+        command: 'downScale'
+    - alert: RemainingDiskSpaceLow
+      expr: (kubelet_volume_stats_available_bytes{job="kubelet",metrics_path="/metrics",namespace=~".*",persistentvolumeclaim=~"kafka-.*"}/ kubelet_volume_stats_capacity_bytes{job="kubelet",metrics_path="/metrics",namespace=~".*",persistentvolumeclaim=~"kafka-.*"})< 0.15 and predict_linear(kubelet_volume_stats_available_bytes{job="kubelet",metrics_path="/metrics",namespace=~".*",persistentvolumeclaim=~"kafka-.*"}[6h], 4 * 24 * 3600) < 0
+      for: 2m
+      labels:
+        severity: alert
+        alertGroup: kafka
+      annotations:
+        description: 'broker has low disk space'
+        summary: 'low diskspace'
+        command: "resizePvc"
+        incrementBy: "10G"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+- apiGroups: [""]
+  resources:
+  - nodes
+  - services
+  - endpoints
+  - pods
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources:
+  - configmaps
+  verbs: ["get"]
+- nonResourceURLs: ["/metrics"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: default
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: kafka-prometheus
+spec:
+  podMonitorSelector:
+    matchLabels:
+      release: prometheus-operator
+  serviceAccountName: prometheus
+  alerting:
+    alertmanagers:
+    - namespace: kafka
+      name: kafka-operator-alertmanager
+      port: alerts
+  serviceMonitorSelector:
+    matchLabels:
+      app: kafka
+      kafka_cr: kafka
+  ruleSelector:
+    matchLabels:
+      prometheus: kafka-rules
+  resources:
+    requests:
+      memory: 400Mi
+  enableAdminAPI: false
